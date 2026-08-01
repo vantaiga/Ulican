@@ -10,7 +10,7 @@ export const MEMORY_MB    = 80
 export const PIN          = process.env.DASHBOARD_PASSKEY || '3530588'
 export const PORT         = parseInt(process.env.PORT || '3000')
 export const MPKEY        = process.env.MODEMPAY_SECRET_KEY || ''
-export const REF          = '(system) Operator: Bun Omar SECKA'
+export const REF          = 'Ulican Operator: Bun Omar SECKA'
 
 // 20 Alchemy endpoints — hardcoded
 export const CHAINS = [
