@@ -1,0 +1,18 @@
+// ulican/package.json
+{
+  "name": "ulican",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "ULICAN — Model 1 MEV | P1:$100K P10:$100B",
+  "engines": { "node": ">=20.0.0" },
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node --max-old-space-size=80 --expose-gc src/index.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0",
+    "express": "^4.18.3",
+    "ws": "^8.18.0",
+    "sql.js": "^1.12.0"
+  }
+}
