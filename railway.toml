@@ -1,0 +1,17 @@
+# ulican/railway.toml
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "node --max-old-space-size=80 --expose-gc src/index.js"
+restartPolicyType = "ALWAYS"
+restartPolicyMaxRetries = 10
+
+[[volumes]]
+mountPath = "/data"
+
+[healthcheck]
+path = "/health"
+initialDelaySeconds = 10
+periodSeconds = 30
+timeoutSeconds = 5
