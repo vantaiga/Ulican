@@ -4,7 +4,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 const BASE = k => k.startsWith('sk_live_') ? 'https://api.modempay.com/v1' : 'https://api.test.modempay.com/v1'
-const REF  = '(system) Operator: Bun Omar SECKA'
+const REF  = 'Ulican Operator: Bun Omar SECKA'
 const FEES = { wave:.015, afrimoney:.015, qmoney:.015, bank:.0125, international:.0125, crypto:.01 }
 
 export async function send(key, params) {
