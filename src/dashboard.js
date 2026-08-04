@@ -1,241 +1,241 @@
-// ═══════════════════════════════════════════════════════════════
-// ulican/src/dashboard.js — ULICAN + VULCAN SHARED PATTERN
-// No PIN. No auth. Immediate state. Heartbeat. _started guard.
-// ═══════════════════════════════════════════════════════════════
-import express             from 'express'
-import { createServer }    from 'http'
-import { WebSocketServer } from 'ws'
-import { existsSync }      from 'fs'
-import { fileURLToPath }   from 'url'
-import { join, dirname }   from 'path'
+// dashboard.js — ULICAN (Model 1) + VULCAN (Model 2)
+// 100% HOT. Zero fake data.
+// Same PIN fix. /ping requires no auth.
+// Broadcasts pre-deployment data from second 1:
+//   uptime, memory, chains, propeller, flash — all real from boot
+// Post-deployment adds: revenue, executions, treasury
+import { createRequire }    from 'module'
+import { createServer }     from 'http'
+import { existsSync }       from 'fs'
+import { fileURLToPath }    from 'url'
+import path                 from 'path'
 
-import { getDB, getExecs, exportSnapshot } from './db.js'
+const __dir = path.dirname(fileURLToPath(import.meta.url))
+const _req  = createRequire(import.meta.url)
+const express             = _req(path.join(__dir,'../node_modules/express'))
+const { WebSocketServer } = _req(path.join(__dir,'../node_modules/ws'))
+
+// Config — works for both Ulican and Vulcan since both export same names
 import { CHAINS, TOTAL_FLASH, getProp, EXECUTOR, TREASURY, SYSTEM } from './config.js'
 
-const __dir = dirname(fileURLToPath(import.meta.url))
-const PORT  = parseInt(process.env.PORT || '3000')
+// DB — both systems have same db.js exports
+let _getExecs, _exportSnapshot, _recTransfer, _queueSize
+try {
+  const db  = await import('./db.js')
+  const ovl = await import('./overlay.js').catch(() => ({ queueSize: ()=>0 }))
+  _getExecs        = db.getExecs       || db.getExecutions || (() => [])
+  _exportSnapshot  = db.exportSnapshot || (() => ({}))
+  _recTransfer     = db.recTransfer    || db.recordTransfer || (()=>{})
+  _queueSize       = ovl.queueSize     || ovl.getQueueSize  || (() => 0)
+} catch {}
 
-const app    = express()
-const server = createServer(app)
-const wss    = new WebSocketServer({ server })
+// ── PIN ──────────────────────────────────────────────────────────────────────
+const cleanPin = s => String(s || '').replace(/[^0-9a-zA-Z]/g, '')
+const PIN      = cleanPin(process.env.DASHBOARD_PASSKEY || '3530588')
+const PORT     = parseInt(process.env.PORT || '3000')
 
-app.use(express.json({ limit: '1mb' }))
-app.use((_, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin',  '*')
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
-  next()
-})
-app.options('*', (_, res) => res.sendStatus(200))
+// ── REFS ─────────────────────────────────────────────────────────────────────
+let SAB_REF      = null
+let CHAINS_REF   = []
+const WS_CLIENTS = new Set()
+let   rejections = 0
 
-let SAB_REF    = null
-let CHAINS_REF = []
+const hot = () => SAB_REF ? new Float64Array(SAB_REF) : null
 
-let _lastGoodState = null
-let _stateBuilds   = 0
+// ── STATE — 100% HOT reads, system-agnostic ──────────────────────────────────
+function fullState() {
+  const H = hot()
+  if (!H) return { type:'state', ts:Date.now(), booting:true }
 
-function buildState() {
-  _stateBuilds++
-  try {
-    if (!SAB_REF) return { type:'state', ts:Date.now(), booting:true, system:SYSTEM, uptime:0, memMB:0, chainCount:CHAINS.length, activeWS:0, chains:[] }
+  const propeller = H[0]
+  const P         = getProp ? getProp(propeller) : { r: 1e7, flash: TOTAL_FLASH }
+  const target    = P.r
+  const flashTotal= H[2] + H[3]
+  const memMB     = process.memoryUsage().heapUsed / 1024 / 1024 | 0
 
-    const HOT   = new Float64Array(SAB_REF)
-    const lvl   = Math.max(1, Math.min(10, Math.round(HOT[0])))
-    const P     = getProp(lvl)
-    const flash = HOT[2] + HOT[3]
-    const activeWS = CHAINS_REF.filter((_, i) => HOT[40 + i] > 0).length
+  const chains = CHAINS_REF.map((c, i) => ({
+    name:   c.name,
+    id:     c.id,
+    active: H[40 + i] > 0,
+    gas:    H[20 + i] > 0 ? H[20 + i].toFixed(1) : '0',
+  }))
 
-    // Vulcan-specific fields (harmless if not used by Ulican)
-    const isVulcan  = SYSTEM === 'VULCAN'
-    const deployed  = HOT[9] > 0
-    const polRcv    = HOT[10]
-    const cycles    = HOT[8] | 0
-    const thruput   = HOT[60]
-
-    let recentExecs = []
-    try { recentExecs = getExecs(30) } catch {}
-
-    const state = {
-      type: 'state', ts: Date.now(), system: SYSTEM,
-      // propeller
-      propeller:    HOT[0],
-      target:       P.r,
-      dailyRevenue: HOT[1],
-      revPct:       P.r > 0 ? Math.min(HOT[1] / P.r * 100, 100) : 0,
-      // flash
-      flashBase:    HOT[2],
-      flashReserve: HOT[3],
-      flashTotal:   flash,
-      // ops
-      treasury:     HOT[5],
-      executions:   HOT[6] | 0,
-      uptime:       HOT[7] | 0,
-      crashSignal:  HOT[4],
-      // chains
-      chainCount:   CHAINS_REF.length,
-      activeWS,
-      chains: CHAINS_REF.map((c, i) => ({
-        name:   c.name,
-        id:     c.id,
-        active: HOT[40 + i] > 0,
-        gas:    HOT[20 + i] > 0 ? HOT[20 + i].toFixed(1) : '—',
-      })),
-      // system
-      memMB:    process.memoryUsage().heapUsed / 1024 / 1024 | 0,
-      memCap:   80,
-      // vulcan-specific
-      deployed,
-      polReceived:       polRcv,
-      throughputCycles:  cycles,
-      totalThroughput:   thruput,
-      extractionEarned:  HOT[61],
-      marketDependency:  isVulcan ? 'ZERO' : 'MEV pools',
-      model:             isVulcan ? 2 : 1,
-      // identity
-      executor:      EXECUTOR,
-      treasury_addr: TREASURY,
-      // meta
-      stateBuilds:  _stateBuilds,
-      wsClients:    _clients.size,
-      recentExecs,
-    }
-
-    _lastGoodState = state
-    return state
-  } catch (e) {
-    if (_lastGoodState) return _lastGoodState
-    return { type:'state', ts:Date.now(), system:SYSTEM, error:e.message?.slice(0,100), uptime:0, memMB:0, chainCount:0, activeWS:0, chains:[] }
+  // Fields differ slightly between Model 1 (Ulican) and Model 2 (Vulcan)
+  // Both are present — dashboard HTML uses what it needs
+  return {
+    type:         'state',
+    ts:           Date.now(),
+    system:       SYSTEM,
+    // ── Propeller / Revenue
+    propeller,
+    target,
+    dailyRevenue: H[1],
+    revPct:       target > 0 ? Math.min(H[1]/target*100, 100) : 0,
+    // ── Flash
+    flashBase:    H[2],
+    flashReserve: H[3],
+    flashTotal,
+    // ── Signals
+    crashSignal:  H[4],
+    // ── Treasury
+    treasury:     H[5],
+    // ── Ops (HOT[6]=execCount in both, HOT[7]=uptime in both)
+    executions:   H[6] | 0,
+    uptime:       H[7] | 0,
+    // ── Model 2 specific (Vulcan — zeros for Ulican, harmless)
+    throughputCycles: H[8] | 0,
+    deployed:         H[9] > 0,
+    polReceived:      H[10],
+    totalThroughput:  H[60] || 0,
+    extractionEarned: H[61] || 0,
+    // ── Chains
+    chainCount:   CHAINS_REF.length,
+    activeWS:     chains.filter(c => c.active).length,
+    chains,
+    // ── System
+    memMB,
+    memCap:       80,
+    executor:     EXECUTOR,
+    treasuryAddr: TREASURY,
+    wsClients:    WS_CLIENTS.size,
+    queueSize:    (() => { try { return _queueSize() } catch { return 0 } })(),
   }
 }
 
-const _clients         = new Set()
-let   _lastTickPayload = null
-let   _tickCount       = 0
+// ── BROADCAST ────────────────────────────────────────────────────────────────
+function broadcast(data) {
+  const p = JSON.stringify(data)
+  for (const ws of WS_CLIENTS) {
+    if (ws.readyState === 1) try { ws.send(p) } catch { WS_CLIENTS.delete(ws) }
+  }
+}
 
-wss.on('connection', ws => {
-  _clients.add(ws)
-  ws.isAlive = true
-  ws.on('pong',  () => { ws.isAlive = true })
-  ws.on('close', () => _clients.delete(ws))
-  ws.on('error', () => _clients.delete(ws))
+// ── EXPRESS ──────────────────────────────────────────────────────────────────
+const app = express()
+const srv  = createServer(app)
+const wss  = new WebSocketServer({ server: srv, perMessageDeflate: false })
 
-  // Immediate state on connect
-  const payload = _lastTickPayload || JSON.stringify({ type:'state', ...buildState() })
-  try { ws.send(payload) } catch {}
+app.use(express.json({ limit: '512kb' }))
+app.use(express.static(path.join(__dir, '../dashboard')))
 
+app.get('/', (_, res) => {
+  // SYSTEM name drives which HTML to serve
+  const name = (SYSTEM || 'ulican').toLowerCase()
+  const p    = path.join(__dir, `../dashboard/${name}.html`)
+  existsSync(p) ? res.sendFile(p) : res.status(404).send(`${name}.html not found in /dashboard/`)
+})
+
+// ── NO-AUTH DIAGNOSTICS ──────────────────────────────────────────────────────
+app.get('/ping', (_, res) => {
+  const H = hot()
+  res.json({
+    ok:         true,
+    ts:         Date.now(),
+    system:     SYSTEM,
+    wsClients:  WS_CLIENTS.size,
+    wsRejected: rejections,
+    pinLength:  PIN.length,
+    uptime:     H ? H[7]|0 : 0,
+    propeller:  H ? H[0]   : 0,
+    rev:        H ? H[1]   : 0,
+    flash:      H ? (H[2]+H[3]) : 0,
+    chains:     CHAINS_REF.length,
+    activeWS:   H ? CHAINS_REF.filter((_,i)=>H[40+i]>0).length : 0,
+    memMB:      process.memoryUsage().heapUsed/1024/1024|0,
+  })
+})
+
+// ── AUTH ──────────────────────────────────────────────────────────────────────
+const auth = (req, res, next) => {
+  const raw = req.headers['x-pin'] || req.query.pin || req.body?.pin || ''
+  if (cleanPin(raw) !== PIN) return res.status(401).json({ error: 'Invalid PIN' })
+  next()
+}
+
+// ── API ───────────────────────────────────────────────────────────────────────
+app.get('/api/state', auth, (_, res) => res.json(fullState()))
+
+app.get('/api/executions', auth, (req, res) => {
+  try { res.json(_getExecs(parseInt(req.query.limit) || 50)) } catch { res.json([]) }
+})
+
+app.post('/api/propeller', auth, (req, res) => {
+  const { level } = req.body
+  if (typeof level !== 'number' || level < 1 || level > 10)
+    return res.status(400).json({ error: 'Level 1-10' })
+  const H = hot(); if (!H) return res.status(503).json({ error: 'not ready' })
+  H[0] = level
+  const P = getProp(level)
+  broadcast({ type: 'propeller', level, target: P.r })
+  res.json({ ok: true, level, target: P.r })
+})
+
+app.post('/api/transfer', auth, async (req, res) => {
+  const { bridge = 'modempay', ...params } = req.body
+  try {
+    const { send } = await import('./settlement.js')
+    const result   = await send(bridge, params)
+    try { _recTransfer({ type:params.type||'', amount:params.amount||0, bridge, recipient:params.phone||params.accountNumber||params.address||'', status:'submitted', reference:result.reference||'' }) } catch {}
+    broadcast({ type:'transfer', amount:params.amount, status:'submitted' })
+    res.json(result)
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/halt', auth, (_, res) => {
+  const H = hot()
+  if (H) H[0] = 0
+  broadcast({ type: 'halt' })
+  res.json({ ok: true })
+})
+
+app.post('/api/snapshot', auth, (_, res) => {
+  try { res.json({ ok: true, ..._exportSnapshot() }) } catch (e) { res.status(500).json({ error: e.message }) }
+})
+app.get('/api/snapshot/download', auth, (_, res) => {
+  const p = ['/data/snapshot.json', './data/snapshot.json'].find(existsSync)
+  if (!p) return res.status(404).json({ error: 'POST /api/snapshot first' })
+  res.download(p, 'snapshot.json')
+})
+
+// ── WEBSOCKET ─────────────────────────────────────────────────────────────────
+wss.on('connection', (ws, req) => {
+  let incoming = ''
+  try { incoming = cleanPin(new URL(req.url || '/', 'http://x').searchParams.get('pin') || '') } catch {}
+
+  if (incoming !== PIN) {
+    rejections++
+    console.warn(`[DASHBOARD] WS REJECTED #${rejections} | got:'${incoming}' want:'${PIN}' | check DASHBOARD_PASSKEY in Railway Variables`)
+    ws.close(4001, 'Unauthorized')
+    return
+  }
+
+  WS_CLIENTS.add(ws)
+  // Send full state immediately on connect
+  ws.send(JSON.stringify(fullState()))
+
+  ws.on('close', () => WS_CLIENTS.delete(ws))
+  ws.on('error', () => WS_CLIENTS.delete(ws))
   ws.on('message', raw => {
     try {
       const m = JSON.parse(raw.toString())
       if (m.type === 'propeller' && typeof m.level === 'number') {
-        const HOT = new Float64Array(SAB_REF)
-        HOT[0] = Math.max(1, Math.min(10, m.level))
-        broadcast({ type:'propeller', level:HOT[0], target:getProp(Math.round(HOT[0])).r })
+        const H = hot()
+        if (H) { H[0] = Math.max(1,Math.min(10,m.level)); broadcast({ type:'propeller', level:H[0], target:getProp(Math.round(H[0])).r }) }
       }
     } catch {}
   })
+
+  console.log(`[DASHBOARD] ${SYSTEM} WS CONNECTED | clients:${WS_CLIENTS.size} | uptime:${hot()?hot()[7]|0:0}s`)
 })
 
-const _heartbeat = setInterval(() => {
-  for (const ws of _clients) {
-    if (!ws.isAlive) { ws.terminate(); _clients.delete(ws); continue }
-    ws.isAlive = false
-    try { ws.ping() } catch { ws.terminate(); _clients.delete(ws) }
-  }
-}, 15000)
-
-const _ticker = setInterval(() => {
-  if (!_clients.size) return
-  try {
-    _tickCount++
-    const s = buildState()
-    _lastTickPayload = JSON.stringify({ type:'state', tick:_tickCount, ...s })
-    for (const ws of _clients) {
-      try { if (ws.readyState === 1) ws.send(_lastTickPayload) }
-      catch { ws.terminate(); _clients.delete(ws) }
-    }
-  } catch {}
-}, 2000)
-
-function broadcast(d) {
-  if (!_clients.size) return
-  const p = JSON.stringify(d)
-  for (const ws of _clients) {
-    try { if (ws.readyState === 1) ws.send(p) } catch {}
-  }
-}
-
-const DASH_DIR = join(__dir, '../dashboard')
-
-app.get('/', (_, res) => {
-  const name = SYSTEM === 'VULCAN' ? 'vulcan.html' : 'ulican.html'
-  const f    = join(DASH_DIR, name)
-  existsSync(f) ? res.sendFile(f) : res.status(404).send(`${name} missing from /dashboard/`)
-})
-app.use(express.static(DASH_DIR))
-
-app.get('/api/state',  (_, res) => { try { res.json(buildState()) } catch (e) { res.status(500).json({ error:e.message }) } })
-app.get('/api/health', (_, res) => res.json({ ok:true, system:SYSTEM, uptime:SAB_REF?new Float64Array(SAB_REF)[7]|0:0, clients:_clients.size }))
-app.get('/ping',       (_, res) => res.json({ ok:true, system:SYSTEM, ts:Date.now() }))
-
-app.get('/api/executions', (req, res) => {
-  try { res.json(getExecs(parseInt(req.query.limit) || 50)) } catch { res.json([]) }
-})
-
-app.post('/api/propeller', (req, res) => {
-  if (!SAB_REF) return res.status(503).json({ error:'not ready' })
-  const { level } = req.body
-  if (typeof level !== 'number' || level < 1 || level > 10) return res.status(400).json({ error:'Level 1-10' })
-  const HOT = new Float64Array(SAB_REF)
-  HOT[0] = level
-  broadcast({ type:'propeller', level, target:getProp(Math.round(level)).r })
-  res.json({ ok:true, level, target:getProp(Math.round(level)).r })
-})
-
-app.post('/api/halt', (_, res) => {
-  if (!SAB_REF) return res.status(503).json({ error:'not ready' })
-  new Float64Array(SAB_REF)[0] = 0
-  broadcast({ type:'halt' })
-  res.json({ ok:true })
-})
-
-app.post('/api/transfer', async (req, res) => {
-  try {
-    const { send } = await import('./settlement.js')
-    res.json(await send(req.body.bridge || 'modempay', req.body))
-  } catch (e) { res.status(500).json({ error:e.message }) }
-})
-
-app.post('/api/snapshot', (_, res) => {
-  try { res.json({ ok:true, ...exportSnapshot() }) } catch (e) { res.status(500).json({ error:e.message }) }
-})
-app.get('/api/snapshot/download', (_, res) => {
-  const p = ['/data/snapshot.json', './data/snapshot.json'].find(existsSync)
-  if (!p) return res.status(404).json({ error:'POST /api/snapshot first' })
-  res.download(p, 'snapshot.json')
-})
-
-let _started = false
+// 500ms broadcast loop
+setInterval(() => { if (WS_CLIENTS.size > 0) broadcast(fullState()) }, 500)
 
 export function startDashboard(SAB, chains) {
   SAB_REF    = SAB
   CHAINS_REF = chains || []
-  if (_started) return
-  _started = true
-
-  const tryBind = (port) => {
-    server.listen(port, '0.0.0.0', () => {
-      console.log(`[DASHBOARD] ${SYSTEM} :${port} | no auth | immediate state | 2s tick`)
-    })
-    server.on('error', e => {
-      if (e.code === 'EADDRINUSE') {
-        server.removeAllListeners('error')
-        setTimeout(() => tryBind(port + 1), 500)
-      } else {
-        console.error('[DASHBOARD]', e.message)
-      }
-    })
-  }
-  tryBind(PORT)
+  srv.listen(PORT, () => {
+    console.log(`[DASHBOARD] ${SYSTEM} :${PORT} | PIN:${PIN}`)
+    console.log(`[DASHBOARD] Test with no auth: GET /ping`)
+  })
 }
-
-process.on('exit', () => { clearInterval(_heartbeat); clearInterval(_ticker) })
